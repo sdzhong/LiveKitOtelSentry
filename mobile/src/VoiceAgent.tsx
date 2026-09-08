@@ -1,10 +1,13 @@
 /**
  * DISTRIBUTED TRACING FLOW:
  * 1. connect() creates a new trace (separate from ui.load) for the LiveKit session
- * 2. getToken() fetches token with x-session-id header for correlation
+ * 2. getToken() fetches token with x-session-id header for correlation; the Sentry SDK
+ *    attaches sentry-trace, baggage and (via propagateTraceparent) W3C traceparent
  * 3. Token server injects trace context into token metadata
  * 4. Agent extracts metadata and continues the trace
  * 5. callBackendError() tests distributed tracing with the /fail endpoint
+ *
+ * All endpoints come from mobile/.env (see .env.example) -- nothing is hardcoded.
  */
 
 import React, {useState, useCallback, useEffect, useRef} from 'react';
@@ -31,7 +34,7 @@ import {sessionId} from '../index';
 
 declare const process: {env: Record<string, string | undefined>};
 
-const LIVEKIT_URL = 'wss://otel-bie1qjw2.livekit.cloud';
+const LIVEKIT_URL = process.env.LIVEKIT_URL || '';
 const ROOM_NAME = process.env.LK_ROOM || 'voice-room';
 const BACKEND_URL =
   process.env.BACKEND_URL ||
@@ -161,6 +164,12 @@ const VoiceAgent: React.FC = () => {
         {name: 'lk.connect', op: 'lk.session', forceTransaction: true},
         async () => {
           try {
+            if (!LIVEKIT_URL) {
+              throw new Error(
+                'LIVEKIT_URL is not set. Add it to mobile/.env and restart Metro with --reset-cache.',
+              );
+            }
+
             requestingTokenRef.current = true;
             setStatusMessage('Getting token...');
             const token = await getToken(identity);
@@ -168,6 +177,11 @@ const VoiceAgent: React.FC = () => {
             setStatusMessage('Connecting...');
             await room.connect(LIVEKIT_URL, token, {autoSubscribe: true});
             await room.localParticipant.setMicrophoneEnabled(true);
+            Sentry.logger.info('Connected to LiveKit room', {
+              room: ROOM_NAME,
+              identity,
+              session_id: sessionId,
+            });
             setStatusMessage('Connected - Speak to the agent');
           } catch (error) {
             console.error('Connection error:', error);
@@ -185,6 +199,7 @@ const VoiceAgent: React.FC = () => {
 
   const disconnect = useCallback(async () => {
     await room.disconnect();
+    Sentry.logger.info('Disconnected from LiveKit room', {session_id: sessionId});
     setStatusMessage('Disconnected');
   }, [room]);
 
