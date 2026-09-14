@@ -34,12 +34,13 @@ from typing import Optional
 from dotenv import load_dotenv
 from opentelemetry import trace
 from opentelemetry.baggage.propagation import W3CBaggagePropagator
-from opentelemetry.context import Context, attach, detach
+from opentelemetry.context import Context, attach
 from opentelemetry.propagate import extract, set_global_textmap
 from opentelemetry.propagators.composite import CompositePropagator
 from opentelemetry.propagators.textmap import default_getter
 from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
+from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor, TracerProvider
+from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 from opentelemetry.trace import SpanKind, Status, StatusCode
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
@@ -85,12 +86,235 @@ _tracer_provider: Optional[TracerProvider] = None
 
 
 class SessionAttributeSpanProcessor(SpanProcessor):
-    """Stamps the current session_id onto every span the process emits."""
+    """
+    Stamps the current session_id onto every span the process emits, as both
+    `session_id` (cross-service correlation) and `gen_ai.conversation.id`
+    (what Sentry's AI > Agents "Conversations" view groups spans by).
+
+    A LiveKit voice session is exactly one conversation, so session_id -- which
+    the frontend generates and the token metadata carries -- is the natural id.
+
+    Both are set unconditionally rather than only on AI spans. Sentry's own
+    native-span logic gates `gen_ai.conversation.id` on the span having a
+    gen_ai op, but that check is impossible here: LiveKit opens `llm_request`
+    with no attributes and only calls set_attributes() afterwards, so at
+    on_start time no gen_ai attribute exists yet to gate on. Gating would
+    match only our own root span (which does pass attributes at creation) and
+    miss every gen_ai.chat span -- the opposite of what's needed.
+    """
 
     def on_start(self, span, parent_context: Optional[Context] = None) -> None:
         session_id = _session_id.get()
         if session_id:
             span.set_attribute("session_id", session_id)
+            span.set_attribute("gen_ai.conversation.id", session_id)
+
+
+# LiveKit emits conversation content as span EVENTS (the older OTel GenAI shape).
+# Sentry's AI > Agents "Conversations" view reads span ATTRIBUTES. These map one to
+# the other. See _GenAIContentExporter below.
+_GENAI_INPUT_EVENTS = {
+    "gen_ai.system.message": "system",
+    "gen_ai.user.message": "user",
+    "gen_ai.assistant.message": "assistant",
+    "gen_ai.tool.message": "tool",
+}
+_GENAI_CHOICE_EVENT = "gen_ai.choice"
+
+
+def _as_message(role: str, body) -> dict:
+    """OTel GenAI message shape: {"role": ..., "parts": [{"type","content"}]}."""
+    parts: list[dict] = []
+    content = (body or {}).get("content")
+    if content:
+        parts.append({"type": "text", "content": content})
+    for raw in (body or {}).get("tool_calls") or []:
+        parts.append({"type": "tool_call", "content": raw})
+    return {"role": (body or {}).get("role") or role, "parts": parts}
+
+
+def _genai_content_attributes(span: ReadableSpan) -> dict:
+    """Build Sentry's gen_ai content attributes from a span's gen_ai.* events."""
+    inputs, outputs = [], []
+    for event in span.events or ():
+        if role := _GENAI_INPUT_EVENTS.get(event.name):
+            inputs.append(_as_message(role, event.attributes))
+        elif event.name == _GENAI_CHOICE_EVENT:
+            outputs.append(_as_message("assistant", event.attributes))
+
+    if not inputs and not outputs:
+        return {}
+
+    # JSON-encoded because OTel attribute values may only be primitives or
+    # homogeneous sequences of primitives -- a list of message objects is not a
+    # legal attribute value, and sentry-sdk stringifies these the same way.
+    #
+    # These two are the whole surface. The legacy gen_ai.response.text and
+    # gen_ai.request.messages are deprecated in sentry-sdk and are not worth
+    # setting: Sentry derives both from the attributes below and returns them
+    # as responseText / requestMessages, while a value we set for
+    # gen_ai.response.text is dropped on ingest (its own search API reports it
+    # as an unknown attribute). LiveKit's gen_ai.choice event carries only
+    # role, content and tool_calls, so nothing else is being left behind.
+    attrs: dict = {}
+    if inputs:
+        attrs["gen_ai.input.messages"] = json.dumps(inputs)
+    if outputs:
+        attrs["gen_ai.output.messages"] = json.dumps(outputs)
+    return attrs
+
+
+class _GenAIContentExporter(SpanExporter):
+    """
+    Wraps the OTLP exporter to copy gen_ai content from span events into the
+    attributes Sentry reads, leaving the original events untouched.
+
+    This runs at export rather than in a SpanProcessor because neither hook can
+    do the job: at on_start the events do not exist yet, and by on_end the span
+    is ended and its attributes are frozen. Here the span is complete and we can
+    emit an enriched copy.
+    """
+
+    def __init__(self, inner: SpanExporter) -> None:
+        self._inner = inner
+        self._enriched = 0
+
+    def export(self, spans) -> SpanExportResult:
+        out = []
+        for span in spans:
+            extra = _genai_content_attributes(span)
+            if not extra:
+                out.append(span)
+                continue
+            if not self._enriched:
+                self._log_first(span, extra)
+            self._enriched += 1
+            out.append(self._enrich(span, extra))
+        return self._inner.export(out)
+
+    @staticmethod
+    def _log_first(span: ReadableSpan, extra: dict) -> None:
+        """
+        Proof that content is actually flowing, not merely that the wrapper got
+        installed. Those are different claims: if LiveKit ever migrates to the
+        attribute-based GenAI convention and stops emitting these events, the
+        bridge still installs and logs cleanly while enriching nothing. This is
+        the line that would go missing, so this is the one worth checking after
+        a livekit-agents or OTel bump.
+        """
+        logger.info(
+            "gen_ai content bridge enriched its first span (%s): %d input / %d output messages",
+            span.name,
+            len(json.loads(extra.get("gen_ai.input.messages", "[]"))),
+            len(json.loads(extra.get("gen_ai.output.messages", "[]"))),
+        )
+
+    @staticmethod
+    def _enrich(span: ReadableSpan, extra: dict) -> ReadableSpan:
+        return ReadableSpan(
+            name=span.name,
+            context=span.context,
+            parent=span.parent,
+            resource=span.resource,
+            attributes={**dict(span.attributes or {}), **extra},
+            events=span.events,
+            links=span.links,
+            kind=span.kind,
+            status=span.status,
+            start_time=span.start_time,
+            end_time=span.end_time,
+            instrumentation_scope=span.instrumentation_scope,
+        )
+
+    def shutdown(self) -> None:
+        return self._inner.shutdown()
+
+    def force_flush(self, timeout_millis: int = 30_000) -> bool:
+        return self._inner.force_flush(timeout_millis)
+
+
+def _assert_livekit_event_contract() -> None:
+    """
+    Check our event-name map still matches the names livekit-agents emits.
+
+    The bridge's real fragility is not the OTel internals it pokes -- those fail
+    loudly -- but this table, which fails silently. If LiveKit renames an event
+    or adds one we do not map, every span still exports and only the affected
+    content goes missing from Sentry.
+
+    Raising is safe here because livekit-agents is exact-pinned in
+    requirements.txt, so this can only fire on a deliberate upgrade -- which is
+    precisely when someone should be looking at it.
+    """
+    try:
+        from livekit.agents.telemetry import trace_types
+    except ImportError as exc:  # pragma: no cover - only on a LiveKit reshuffle
+        raise RuntimeError(
+            "cannot verify the gen_ai event contract: livekit.agents.telemetry."
+            "trace_types has moved. Re-check the event names in "
+            "_GENAI_INPUT_EVENTS against the new location before upgrading."
+        ) from exc
+
+    theirs = {
+        v
+        for k, v in vars(trace_types).items()
+        if k.startswith("EVENT_GEN_AI_") and isinstance(v, str)
+    }
+    ours = set(_GENAI_INPUT_EVENTS) | {_GENAI_CHOICE_EVENT}
+    if ours != theirs:
+        raise RuntimeError(
+            "gen_ai event contract drifted from livekit-agents: "
+            f"unmapped by us {sorted(theirs - ours)!r}, "
+            f"no longer emitted by LiveKit {sorted(ours - theirs)!r}. "
+            "Update _GENAI_INPUT_EVENTS / _GENAI_CHOICE_EVENT to match."
+        )
+
+
+def _install_genai_content_bridge(provider: TracerProvider) -> None:
+    """
+    Wrap whatever exporter OTLPIntegration installed. It adds its own
+    BatchSpanProcessor(OTLPSpanExporter) to our provider during sentry_sdk.init,
+    and exposes no hook to customise it, so we reach in and wrap it after the
+    fact.
+
+    Where the exporter lives moved in the OTel SDK: up to 1.33 `span_exporter`
+    was a plain attribute on BatchSpanProcessor; from 1.34 it is a read-only
+    property delegating to `_batch_processor._exporter`, so assigning to it
+    raises AttributeError. Since livekit-agents 1.7.1 floors OTel at 1.39, the
+    property spelling is the only one that can apply here -- the attribute
+    fallback is kept only so this keeps working if that floor ever drops.
+
+    Deliberately raises rather than warning. A bridge that fails to install
+    costs no spans and no errors -- the agent runs perfectly, and only the
+    conversation content is quietly missing from Sentry, which is exactly the
+    kind of breakage that survives a release unnoticed.
+    """
+    installed = False
+    for proc in provider._active_span_processor._span_processors:
+        exporter = getattr(proc, "span_exporter", None)
+        if exporter is None or isinstance(exporter, _GenAIContentExporter):
+            continue
+
+        wrapped = _GenAIContentExporter(exporter)
+        batch = getattr(proc, "_batch_processor", None)
+        if batch is not None and hasattr(batch, "_exporter"):
+            batch._exporter = wrapped  # opentelemetry-sdk >= 1.34
+        else:
+            proc.span_exporter = wrapped  # opentelemetry-sdk <= 1.33
+
+        if proc.span_exporter is not wrapped:
+            raise RuntimeError(
+                f"gen_ai content bridge could not wrap the exporter on "
+                f"{type(proc).__name__}; the OTel SDK internals have moved again"
+            )
+        installed = True
+        logger.info("gen_ai content bridge installed on %s", type(proc).__name__)
+
+    if not installed:
+        raise RuntimeError(
+            "gen_ai content bridge found no exporter to wrap -- expected "
+            "OTLPIntegration to have added a BatchSpanProcessor to the provider"
+        )
 
 
 def _setup_otlp_logs(dsn: str) -> None:
@@ -178,6 +402,11 @@ def _init_telemetry() -> None:
             LoggingIntegration(capture_sentry_logs=True),
         ],
     )
+
+    # Must run after sentry_sdk.init -- that is when OTLPIntegration adds the
+    # BatchSpanProcessor whose exporter we wrap.
+    _assert_livekit_event_contract()
+    _install_genai_content_bridge(provider)
 
     # Accept either carrier shape: W3C traceparent/baggage *or* sentry-trace/baggage.
     set_global_textmap(
@@ -313,13 +542,15 @@ async def entrypoint(ctx: JobContext) -> None:
             "livekit.participant": participant.identity,
         },
     )
-    context_token = attach(trace.set_span_in_context(session_span))
+    # Attached for the lifetime of the job. Deliberately never detached: the
+    # shutdown callback below runs on a different asyncio task, and a context
+    # token can only be reset in the context that created it.
+    attach(trace.set_span_in_context(session_span))
 
     async def end_session_span(reason: str = "") -> None:
         if reason:
             session_span.set_attribute("lk.shutdown_reason", reason)
         session_span.end()
-        detach(context_token)
         # Flush both pipelines before the process exits, or batched spans are lost.
         if _tracer_provider is not None:
             _tracer_provider.force_flush(5_000)

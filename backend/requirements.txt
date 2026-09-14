@@ -11,6 +11,17 @@ livekit-api==1.2.1
 # OTLP/HTTP exporter. The plain [opentelemetry] extra is NOT enough.
 sentry-sdk[opentelemetry-otlp]>=2.68.1
 
+# Holds the OTel core at 1.44.0: distro 0.65b0's [otlp] extra exact-pins
+# opentelemetry-exporter-otlp==1.44.0, which cascades to sdk/api/proto.
+# Redundant for resolution (livekit-agents 1.7.1 caps at <1.45 and lands here
+# anyway) but deliberate: agent.py's _GenAIContentExporter wraps OTLPIntegration's
+# exporter via private internals that move -- span_exporter went read-only in SDK
+# 1.34. When that bridge breaks nothing fails loudly; spans, traces and token
+# counts keep working and only conversation content vanishes from AI > Agents.
+# After bumping, confirm the agent logs "gen_ai content bridge enriched its
+# first span" -- the install line alone does not prove content is flowing.
+opentelemetry-distro[otlp]>=0.65b0,<0.66b0
+
 python-dotenv>=1.0.0
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
