@@ -5,7 +5,8 @@
  *    attaches sentry-trace, baggage and (via propagateTraceparent) W3C traceparent
  * 3. Token server injects trace context into token metadata
  * 4. Agent extracts metadata and continues the trace
- * 5. callBackendError() tests distributed tracing with the /fail endpoint
+ * 5. callBackendError() re-enters the session's trace, so a mid-conversation
+ *    error shows up alongside the conversation rather than in its own trace
  *
  * All endpoints come from mobile/.env (see .env.example) -- nothing is hardcoded.
  */
@@ -65,6 +66,14 @@ const getToken = async (identity: string): Promise<string> => {
 const VoiceAgent: React.FC = () => {
   const [room] = useState(() => new Room());
   const requestingTokenRef = useRef(false);
+  // The lk.connect trace, held for the life of the session. Anything the user
+  // does mid-conversation joins this instead of the app's ambient trace, so a
+  // session and the errors raised during it are one trace. Null when idle.
+  const sessionTraceRef = useRef<{
+    traceId: string;
+    sampleRand: number;
+    parentSpanId: string;
+  } | null>(null);
   const [identity] = useState(() => `mobile-${Date.now()}`);
   const [connectionState, setConnectionState] = useState<ConnectionState>(
     ConnectionState.Disconnected,
@@ -158,11 +167,20 @@ const VoiceAgent: React.FC = () => {
       const newTraceId = Array.from({length: 32}, () =>
         Math.floor(Math.random() * 16).toString(16),
       ).join('');
-      scope.setPropagationContext({traceId: newTraceId, sampleRand: Math.random()});
+      const sampleRand = Math.random();
+      scope.setPropagationContext({traceId: newTraceId, sampleRand});
 
       Sentry.startSpan(
         {name: 'lk.connect', op: 'lk.session', forceTransaction: true},
-        async () => {
+        async span => {
+          // Captured here rather than from the ref's closure so mid-session
+          // work can re-enter this trace even after lk.connect itself has
+          // ended -- the span is the parent, not the container.
+          sessionTraceRef.current = {
+            traceId: newTraceId,
+            sampleRand,
+            parentSpanId: span.spanContext().spanId,
+          };
           try {
             if (!LIVEKIT_URL) {
               throw new Error(
@@ -184,6 +202,8 @@ const VoiceAgent: React.FC = () => {
             });
             setStatusMessage('Connected - Speak to the agent');
           } catch (error) {
+            // No session to attach later work to.
+            sessionTraceRef.current = null;
             console.error('Connection error:', error);
             setStatusMessage(
               error instanceof Error ? error.message : 'Connection failed',
@@ -198,6 +218,7 @@ const VoiceAgent: React.FC = () => {
   }, [room, identity]);
 
   const disconnect = useCallback(async () => {
+    sessionTraceRef.current = null;
     await room.disconnect();
     Sentry.logger.info('Disconnected from LiveKit room', {session_id: sessionId});
     setStatusMessage('Disconnected');
@@ -211,19 +232,57 @@ const VoiceAgent: React.FC = () => {
     }
   }, [connectionState, connect, disconnect]);
 
-  // Tests distributed tracing: frontend span → backend span (correlated by session_id)
+  // Tests distributed tracing: frontend span → backend span → Sentry error, all
+  // inside the active session's trace.
   const callBackendError = useCallback(() => {
     setStatusMessage('Calling backend /fail ...');
-    Sentry.startSpan({name: 'debug.call_backend_fail', op: 'http.client'}, async () => {
-      const resp = await fetch(`${BACKEND_URL}/fail`, {
-        headers: {'x-session-id': sessionId},
+
+    const run = () =>
+      Sentry.startSpan(
+        {name: 'debug.call_backend_fail', op: 'http.client'},
+        async span => {
+          const resp = await fetch(`${BACKEND_URL}/fail`, {
+            headers: {'x-session-id': sessionId},
+          });
+          if (!resp.ok) {
+            const body = await resp.text();
+            const error = new Error(`/fail responded ${resp.status}: ${body}`);
+            // Two things are needed here.
+            //
+            // First, capture at all: startSpan marks the span errored and
+            // rethrows, but never calls captureException -- and the .catch()
+            // below stops that rethrow reaching the global handler, so without
+            // this the error would reach Sentry nowhere.
+            //
+            // Second, withActiveSpan. Hermes has no async context tracking, so
+            // the span startSpan made active is already gone by the time this
+            // runs after the awaits above. A bare captureException here falls
+            // back to the scope's propagation context and attaches the error to
+            // lk.connect -- right trace, wrong span. Re-binding explicitly puts
+            // it on this http.client span, where it belongs.
+            Sentry.withActiveSpan(span, () => {
+              Sentry.captureException(error);
+            });
+            throw error;
+          }
+        },
+      ).catch(() => {
+        setStatusMessage('Backend error captured (see Sentry)');
       });
-      if (!resp.ok) {
-        const body = await resp.text();
-        throw new Error(`/fail responded ${resp.status}: ${body}`);
-      }
-    }).catch(() => {
-      setStatusMessage('Backend error captured (see Sentry)');
+
+    const sessionTrace = sessionTraceRef.current;
+    if (!sessionTrace) {
+      // Not connected: nothing to join, so this keeps its own trace.
+      run();
+      return;
+    }
+
+    // Re-enter the session's trace. Without this the call inherits the
+    // propagation context created at app start, which is why these landed in a
+    // long-lived trace of their own, disconnected from the conversation.
+    Sentry.withScope(scope => {
+      scope.setPropagationContext(sessionTrace);
+      run();
     });
   }, []);
 
