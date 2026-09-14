@@ -1,7 +1,15 @@
-# Environment files
+# Environment files -- every .env variant, at any depth, including editor
+# backups and copies like .env.bak / .env.local / .env.save. The explicit
+# per-directory lines this replaces did not cover those, so a stray backup of
+# a real .env was untracked but NOT ignored, and one `git add -A` away from
+# being committed with its secrets. The .example templates are re-included
+# because they are meant to be in the repo.
 .env
-backend/.env
-mobile/.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
 
 # Python
 __pycache__/
