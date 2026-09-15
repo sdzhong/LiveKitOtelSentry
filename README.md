@@ -58,10 +58,17 @@ still end up in one trace:
 
 ### Prerequisites
 
-- Python 3.11+
+- Python 3.11+ (developed against 3.12)
 - Node.js 20+
-- Xcode 16.4+ and iOS 15+ (required by `@sentry/react-native` 8.x)
+- Xcode 16.4+ with an iOS 15+ simulator (required by `@sentry/react-native` 8.x;
+  verified on Xcode 16.4 with an iPhone 16 Pro simulator on iOS 18.2)
 - CocoaPods (`gem install cocoapods`)
+
+`backend/requirements.txt` pins `opentelemetry-distro[otlp]` on purpose. The pin is not
+needed to get a working install — an unpinned resolve lands on the same versions — it
+is there so an OTel upgrade is a deliberate edit rather than something that arrives
+silently, because the gen_ai content bridge reaches through private OTel internals that
+have moved before. The comment in the file has the details.
 
 ### Step 1: Get API Keys
 
@@ -70,7 +77,7 @@ still end up in one trace:
 | LiveKit Cloud | https://cloud.livekit.io | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` |
 | OpenAI **or** OpenRouter | https://platform.openai.com/api-keys · https://openrouter.ai/keys | `OPENAI_API_KEY` **or** `OPENROUTER_API_KEY` |
 | Deepgram | https://console.deepgram.com | `DEEPGRAM_API_KEY` |
-| Sentry | https://sentry.io | `SENTRY_DSN` (create **two** projects: Python + React Native) |
+| Sentry | https://sentry.io | Two `SENTRY_DSN`s — create **two** projects, one **Python** (for the backend) and one **React Native** (for the mobile app) |
 
 ### Step 2: Backend Setup
 
@@ -129,11 +136,17 @@ npx react-native start --reset-cache
 
 ### Step 5: Test It
 
-1. App opens in the iOS Simulator
-2. Tap **"Connect to Agent"** — requests a token, connects to LiveKit
+1. The app opens in the iOS Simulator
+2. **Tap the circle** — requests a token and connects to LiveKit. The circle is the
+   connect/disconnect control; there is no separate connect button
 3. Speak into the mic — the agent responds
-4. Tap **"Call Backend (error)"** — triggers a backend 500 for the tracing demo
-5. Open **Sentry → Explore → Traces** to see the distributed trace
+4. **While still connected**, tap **"Call Backend (error)"** — triggers a backend 500.
+   Staying connected is what puts the error in the conversation's trace instead of one of
+   its own; see [Errors in the trace](#errors-in-the-trace)
+5. Then look at:
+   - **Explore → Traces** — the distributed trace, all three services in one tree
+   - **AI → Agents → Conversations** — the transcript, grouped by `session_id`
+   - **Issues** — the mobile `Error` and the token server's `HTTPException`
 
 ## How Distributed Tracing Works
 
@@ -148,6 +161,11 @@ npx react-native start --reset-cache
    *every* span, including LiveKit's internal ones
 6. **Sentry** receives spans from the Sentry SDK and from OTLP and correlates by
    `trace_id`
+
+One oddity in the resulting tree: `invoke_agent` is a child of the `/token` span and
+outlives it by the whole session, because the trace context travels in the JWT metadata
+rather than in a request that stays open. Sentry renders it fine; it just looks strange in
+a waterfall.
 
 ### Why there's no SDK conflict
 
@@ -175,9 +193,114 @@ That works because of two things meeting in the middle:
 `gen_ai.operation.name = "invoke_agent"` and `gen_ai.agent.name`, so the
 agent → chat hierarchy renders instead of orphaned LLM spans.
 
-**Known gap:** Sentry's conventions list `gen_ai.response.model` as a MUST for LLM spans,
-and LiveKit does not currently emit it. Sentry also does **not** ingest OTLP metrics, so
-LiveKit's OTel metrics stay local.
+### Conversation content (input/output)
+
+Token counts and the agent → chat hierarchy arrive on their own. The **message bodies do
+not**, and the reason is a spec migration that LiveKit and Sentry sit on opposite sides of:
+
+- LiveKit emits conversation content as span **events** — `gen_ai.system.message`,
+  `gen_ai.user.message`, `gen_ai.choice`. Its own constants call these "OpenTelemetry
+  GenAI event names (for structured logging)".
+- Sentry's Conversations view reads span **attributes** — `gen_ai.input.messages` and
+  `gen_ai.output.messages`, each a stringified array of message objects.
+
+Same information, different field of the span payload. Everything else lines up, which
+makes the symptom subtle: spans, hierarchy and token usage all render correctly while the
+transcript is simply empty.
+
+Nothing in the stack closes that gap on its own. Sentry ships gen_ai instrumentation that
+writes those attributes, but it only fires when the Sentry SDK instruments the LLM call —
+and here the agent creates spans through pure OTel by design.
+
+So `agent.py` bridges it. `_GenAIContentExporter` wraps the exporter `OTLPIntegration`
+installs and copies content out of the events into the attributes Sentry reads, leaving
+the original events untouched. It has to run at export: at `on_start` the events do not
+exist yet, and by `on_end` the span is ended and its attributes are frozen.
+
+Two guards come with it, because the failure mode is silent — spans keep exporting, only
+the transcript goes missing:
+
+- `_assert_livekit_event_contract()` checks the event-name map against `livekit-agents`'
+  own `EVENT_GEN_AI_*` constants in both directions and raises on drift. `livekit-agents`
+  is exact-pinned, so this can only fire on a deliberate upgrade.
+- The bridge logs once when it actually **enriches** a span:
+  `gen_ai content bridge enriched its first span (llm_request): 3 input / 1 output messages`
+  That is the line to check after upgrading OTel or LiveKit. The install-time line only
+  proves the wrapper is in place, not that content is flowing — if LiveKit ever moves to
+  the attribute convention and stops emitting events, the bridge installs cleanly and
+  enriches nothing.
+
+Only `gen_ai.input.messages` and `gen_ai.output.messages` are set. The legacy
+`gen_ai.response.text` and `gen_ai.request.messages` are deprecated in `sentry-sdk`:
+Sentry derives both and serves them back as `responseText` / `requestMessages`, and a
+value set for `gen_ai.response.text` is dropped on ingest — its own search API reports it
+as an unknown attribute.
+
+Conversations are grouped by `gen_ai.conversation.id`, which the agent stamps from
+`session_id` onto **every** span rather than only AI ones. LiveKit opens `llm_request`
+with no attributes and sets them afterwards, so gating at `on_start` would match only the
+root span and miss every `gen_ai.chat` span. One consequence worth knowing: a conversation
+can span several traces, because `session_id` outlives a single connect.
+
+**Not ingested:** Sentry does not ingest OTLP metrics, so LiveKit's OTel metrics stay
+local. (`gen_ai.response.model` was previously a gap here; `livekit-agents` 1.7.1 does
+emit it, and it arrives on the `gen_ai.chat` spans.)
+
+## Errors in the trace
+
+Tap **"Call Backend (error)"** during a session and the error lands in the conversation's
+trace, attached to the span that made the failing request. Three things are needed for
+that, and each one is easy to get wrong.
+
+**The error has to be captured at all.** `Sentry.startSpan` marks its span errored and
+rethrows, but it never calls `captureException`. If the caller catches that rethrow — as
+this app does, to show a status message — the error reaches Sentry nowhere, while the
+span still shows as failed. `callBackendError` captures it explicitly, inside the span.
+
+**The call has to run in the session's trace.** `connect()` deliberately forks a fresh
+trace for the session with `scope.setPropagationContext`. Anything started outside that
+scope inherits the propagation context created at app start instead, which is why button
+presses used to collect in one long-lived trace unrelated to any conversation. The
+session's trace is held in a ref for the life of the session and re-entered on each call;
+when disconnected, the call keeps a trace of its own.
+
+**The capture has to be bound to the span.** Hermes has no async context tracking, so the
+span `startSpan` made active is already gone once execution resumes after an `await`. A
+bare `captureException` there falls back to the scope's propagation context and attaches
+the error to `lk.connect` — right trace, wrong span. `Sentry.withActiveSpan(span, ...)`
+puts it on the `http.client` span where it belongs.
+
+That last point generalises: **in React Native, any Sentry call after an `await` has lost
+the active span.** Re-bind explicitly whenever the association matters.
+
+The result is one trace per session:
+
+```
+lk.connect [lk.session]
+  ├─ POST → /token → invoke_agent voice-assistant
+  │                    └─ agent_session
+  │                       ├─ user_turn / agent_turn …
+  │                       └─ llm_request [gen_ai.chat]
+  └─ debug.call_backend_fail → GET → /fail
+```
+
+Errors from both sides land in it: the mobile `Error`, the token server's
+`HTTPException`, and its error-level log.
+
+## Gotchas when testing
+
+- **Fast Refresh cannot be trusted** for the Sentry wiring in `mobile/`. Cold-restart the
+  app before judging a run:
+  ```bash
+  D=<simulator-udid>; B=org.reactjs.native.example.LiveKitVoiceAgent
+  xcrun simctl terminate $D $B && xcrun simctl launch $D $B
+  ```
+- **Give Sentry a minute to ingest.** A trace queried seconds after a session ends can
+  show a fraction of its spans — an incomplete trace looks identical to a broken one.
+- **`BACKEND_URL` goes stale when you change networks.** Re-check
+  `ipconfig getifaddr en0`, update `mobile/.env`, and restart Metro with `--reset-cache`.
+- **`session_id` is generated once at app start**, so reconnecting without restarting the
+  app groups the new session into the same Sentry conversation.
 
 ## What's Sentry-current here
 
