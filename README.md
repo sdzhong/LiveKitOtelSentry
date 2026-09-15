@@ -195,6 +195,25 @@ agent → chat hierarchy renders instead of orphaned LLM spans.
 
 ### Conversation content (input/output)
 
+**TL;DR** — `agent.py` wraps Sentry's OTLP exporter so conversation content is copied from
+span *events* into span *attributes*.
+
+- **What breaks without it.** LiveKit writes message content as span events; Sentry's
+  Conversations view reads it from span attributes. Same information, different field of
+  the span payload — so the transcript arrives empty.
+- **Why it is easy to miss.** Nothing errors. Spans, the agent → chat hierarchy, token
+  counts and costs are all correct; only the message bodies are blank.
+- **Why nothing else covers it.** Sentry ships gen_ai instrumentation that writes those
+  attributes, but it only fires when the Sentry SDK instruments the LLM call — and here
+  the agent creates spans through pure OTel by design.
+- **Why at the exporter.** At `on_start` the events do not exist yet; by `on_end` the span
+  is ended and its attributes are frozen. Export is the only point where the span is both
+  complete and still changeable.
+- **How long it is needed.** Version-skew glue. If LiveKit adopts the attribute
+  convention, `_genai_content_attributes` returns nothing and the bridge becomes a no-op.
+
+The rest of this section is the detail.
+
 Token counts and the agent → chat hierarchy arrive on their own. The **message bodies do
 not**, and the reason is a spec migration that LiveKit and Sentry sit on opposite sides of:
 
@@ -204,9 +223,12 @@ not**, and the reason is a spec migration that LiveKit and Sentry sit on opposit
 - Sentry's Conversations view reads span **attributes** — `gen_ai.input.messages` and
   `gen_ai.output.messages`, each a stringified array of message objects.
 
-Same information, different field of the span payload. Everything else lines up, which
-makes the symptom subtle: spans, hierarchy and token usage all render correctly while the
-transcript is simply empty.
+The split is deliberate in the spec's history, not an accident: content is bulky and often
+sensitive, so the original convention put it in events, where it could be routed to a logs
+pipeline and sampled or redacted independently of the span. The convention later
+consolidated onto stringified-JSON attributes. You can see Sentry mid-migration in its own
+constants, where `gen_ai.response.text` is already deprecated in favour of
+`gen_ai.output.messages`.
 
 Nothing in the stack closes that gap on its own. Sentry ships gen_ai instrumentation that
 writes those attributes, but it only fires when the Sentry SDK instruments the LLM call —
